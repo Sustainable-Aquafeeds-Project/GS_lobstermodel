@@ -1,0 +1,858 @@
+---
+title: Lobster GS model calibration
+format: html
+editor: visual
+---
+
+## Calibration work-flow for Lobster GS model application
+
+**Step 0.** Create reverse mode input files for each experimental dataset
+
+**Step 1.** Run **app.R** to explore parameters to tune model to observations in reverse mode (Initial model exploration)
+
+**Step 2.** Determine **initial** fV by fitting regression of Lipid vs Protein intakes across feeds for the experimental observation and run as inputs in forward mode
+
+**Step 3.** Using initial fV and model inputs estimate the best parameter set for each feed (lowest error between pred and obs) for the selected parameter(s) to be tuned by using optimization or grid-search#
+
+**Step 4.** Repeat Steps 0-3 for each experiment and make plot of pred vs obs across all model and data.
+
+**Step 5.** Using best parameter sets for all experiments, run model in forward mode to predict N waste vs % Protein in Feed (and could predict other outputs such as growth, respiration etc., to explore further)
+
+## **We are working with 3 datasets**
+
+1.  Wirtz et al. 2022
+2.  Landman et al 2021a
+3.  Landman et al. 2021b
+
+## The code below is for Wirtz et al 2022
+
+```{r}
+rm(list=ls()) 
+library(conflicted)
+library(shiny)
+library(plotly) 
+library(DT)
+library(tidyverse)
+library(pbapply)
+library(ggrepel) 
+library(purrr)
+```
+
+### Step 0 - get data
+
+ensure tau and eta values correspond to this tau 0.04; eta 0.00001 in the GS_modelfunctions.R file
+
+```{r}
+#EXPERIMENT 1 -> wirtzinput.csv and wirtzobs.csv
+source("GS_model_functions.R")
+fvinput<-read.csv("input_Data/wirtzinput.csv")
+fvinput$Protein_intake<-NA
+fvinput$Lipid_intake<-NA
+input<-read.csv("input_Data/wirztobs.csv")  
+```
+
+### Step 1 - run app
+
+```{r}
+source("app.R") #shiny_gs() ## interactively, this indicates kstarN as candidate parameter
+```
+
+### Step 2 - get fV values
+
+use linear regression or exact observed intake values for each feed
+
+```{r}
+coefs<-lm(data=input,Lipid_intake ~Protein_intake-1) 
+predLI<-predict(coefs) #Predicts corresponding lipid intake for each value of protein intake
+```
+
+#### predict fV for each datapoint
+
+since we have observed values of intakes,we use the code below to gather fV in GS forward mode
+
+*Note: we are assuming model defaults of kstarN and phi before estimating candidate parameters below*
+
+```{r}
+out<-pbapply(X=as.matrix(input[,c(2,3,5,6)]),1,GSforwardmodel,kstarN=0.9,phi=0) 
+fV<-c(out[[1]]$fV,out[[2]]$fV,out[[3]]$fV,out[[4]]$fV)
+# add to obsinput
+input$fV<-fV
+```
+
+*IMPORTANT: check fV values for all feeds here. If any of them are 0, please change the optimisation function to optim (c(0.9,0) instead of the model default optim (c(0.9,0.5) we assume from Anderson et al 2020*
+
+### Step 3 - get best parameter set for each feed type using optimisation function
+
+```{r}
+# Control parameters for optimization
+control_params <- list(maxit = 50000) 
+
+FMest<-optim(c(0.9,0.5),getError,input=input,feed="FM",paramname="both",method="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001), control = control_params)
+# fV= 0 here so I changed the value of phi for KM
+KMest<-optim(c(0.9,0.0),getError,input=input,feed="KM",paramname="both",method="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001),control = control_params) 
+
+SBMest<-optim(c(0.9,0.5),getError,input=input,feed="SBM",paramname="both",method="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001),control = control_params) 
+
+# fV= 0 here so I changed the value of phi for SWM
+SWMest<-optim(c(0.9,0),getError,input=input,feed="SWM",paramname="both",method ="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001),control = control_params) 
+pars<-rbind(FMest$par, KMest$par,SBMest$par,SWMest$par)
+
+#check to see if these make sense 
+feed=c("FM","KM","SBM","SWM")
+input$pred_Protein_intake<-NA
+input$pred_Lipid_intake<-NA
+for (i in 1:4) { 
+finput<-data.frame(G=input[input$Feed==feed[i],"G"],fV=input[input$Feed==feed[i],"fV"],
+ betaV=input[input$Feed==feed[i],"betaV"],betaH=input[input$Feed==feed[i],"betaH"], 
+ input[input$Feed==feed[i],"Lipid_intake"],input[input$Feed==feed[i],"Protein_intake"])
+ input[i,c(8:9)]<-GSreversemodel(finput,kstarN = pars[i,1],phi = pars[i,2]) } 
+#adding kstarN and phi to input dataframe 
+input$kstarN<-pars[,1]
+input$phi<-pars[,2]
+
+#saving input here to use as dataframe for goodness of fit plot (fig 5 of MS)
+saveRDS(input,"fig5wirtzdata.RDS") #we will call on this later to plot figure 5. the outputs here are different to the "newwirtzinput.RDS" file which is used as inputs for GS forward model 
+```
+
+#### Create full array of inputs for fV 0 –\>1 to predict intake array (rails)
+
+```{r}
+## replace matrix 10 times for each value of fV 0:1
+M <- as.matrix(input[,-1]) 
+input_array <- matrix(rep(t(M), 1000), ncol=dim(M)[2], byrow=TRUE) 
+colnames(input_array) <- names(input[,-1])
+input_array <- data.frame(Feed=input[,1], input_array) 
+
+# replace fVs with values from 0.001 to 1 in steps of 0.001
+input_array[,"fV"] <- rep(seq(0.001, 1, 0.001), each=nrow(M))
+
+# write over observed Protein and Lipid intake values with predicted ones
+for (i in 1:dim(input_array)[1]) {
+    input_array[i, c("pred_Protein_intake", "pred_Lipid_intake")] <- unlist(GSreversemodel(
+        input_array[i, ],
+        kstarN = input_array[i, "kstarN"],
+        phi = input_array[i, "phi"]
+    ))
+}
+
+```
+
+#### get calibrated predictions for plotting figure 3
+
+```{r}
+input$pred_Protein_intake<-NA
+input$pred_Lipid_intake<-NA 
+for (i in 1:4){ input[i,c(8:9)]<-GSreversemodel(as.matrix(input[i,-1]),kstarN = input[i,"kstarN"],phi = input[i,"phi"]) }
+```
+
+### Figure 4: Wirtz plot intake arrays
+
+plotting input arrays, comparing calibrated vs uncalibrated vs expt
+
+```{r}
+library(viridisLite)
+library(viridis) 
+library(ggplot2) 
+library(ggrepel)
+
+wirtzplot <- ggplot(input, aes(x = Protein_intake, y = Lipid_intake, group = G)) +
+  geom_point(size = 3.5, aes(color = G)) +
+  geom_point(size = 6, shape = "X", data = input, aes(x = pred_Protein_intake, y = pred_Lipid_intake, color = G)) +
+  geom_abline(slope = unlist(coefs[1]), intercept = 0, linetype = 2) +
+  geom_path(data = input_array, aes(x = pred_Protein_intake, y = pred_Lipid_intake, color = G)) +
+  scale_color_viridis_c() + 
+  lims(x = c(0, 0.11), y = c(0, 0.06)) +
+  labs(size = 4, 
+       x = expression("Protein intake mol C mol C"^"-1" * " day"^"-1"),
+       y = expression("Lipid intake mol C mol C"^"-1" * " day"^"-1"),
+       color = "growth rate") +
+  theme(axis.title = element_text(size = 14)) +
+  theme(legend.position = c(1, 1), 
+        legend.justification = c("right", "top"), 
+        legend.box.just = "right", 
+        legend.margin = margin(6, 6, 6, 6)) +
+  geom_text_repel(size = 3, data = input, aes(label = Feed)) +
+  annotate("text", x = 0.008, y = 0.008, label = "fV=0.37", angle = 0) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"))
+
+wirtzplot <- wirtzplot + theme(aspect.ratio = 0.75)
+#note that since SWM phi value is also predicted as 0, WE DONT NEED THE DOTTED LINE 
+print(wirtzplot)
+
+#ggsave("manuscript_plots/wirtzplot.png",wirtzplot)
+```
+
+### we also need to predict waste output here before moving on to the next experiment
+
+```{r}
+names(input)[8]<-"Protein_intake" 
+names(input)[9]<-"Lipid_intake" 
+saveRDS(input,"newwirtzinput.RDS")
+```
+
+### now we do wirtz waste plot in forward mode for Figure 3
+
+```{r}
+wirtzfwdmode<-readRDS("newwirtzinput.RDS")
+rownames<-wirtzfwdmode$Feed #select which columns are needed to run in forward mode 
+wirtzfwdmode<-as.matrix(wirtzfwdmode[,c(5,6,8,9,10,11)]) 
+rownames(wirtzfwdmode)<-rownames # below the columns being selected needed to be fixed: 
+out2<-pbapply(X=wirtzfwdmode,1,GSforwardmodel) # test run holding kstarN and phi constant
+test2<-pbapply(X=wirtzfwdmode[,c(1,2,3,4)],1,GSforwardmodel,kstarN=0.9,phi=0)
+out2<-pbapply(X=wirtzfwdmode,1,GSforwardmodel) 
+
+out3<-c(out2[[1]]$Pellet_N,out2[[2]]$Pellet_N,out2[[3]]$Pellet_N,out2[[4]]$Pellet_N)
+```
+
+#### TEST: compare predictions with test
+
+```{r}
+test3<-c(test2[[1]]$Pellet_N,test2[[2]]$Pellet_N,test2[[3]]$Pellet_N,test2[[4]]$Pellet_N) # waste looks the same
+
+outg<-c(out2[[1]]$Growth_G,out2[[2]]$Growth_G,out2[[3]]$Growth_G,out2[[4]]$Growth_G) 
+testg<-c(test2[[1]]$Growth_N,test2[[2]]$Growth_N,test2[[3]]$Growth_N,test2[[4]]$Growth_N) # growth is very different
+#printoutput 
+print(out2)
+#now convert to df 
+wirtzfwdmode<-data.frame(wirtzfwdmode) 
+wirtzfwdmode$Nwaste<-out3
+wirtzfwdmode$CP_feed<-c(63.75,65.1,60.05,60.55)
+wirtzfwdmode$Feed<-rownames
+#saveRDS(wirtzfwdmode, "wirtzfwdmodedata.RDS") #dont need these but saving in case we need to look at the dataset
+```
+
+#### Plotting
+
+remember to save parameter values and outputs above (for other metabolic outputs) from above
+
+### FIGURE 3: panel plot (3 rows).
+
+##### A: C:N ratio of feeds vs growth rate day-1; plot showing relationship between feed C:N ratio and growth
+
+##### B: C:N ratio of feeds vs N waste output mol N mol C-1 day-1; Relationship between C:N ratio and faecal N waste output
+
+##### C: Differences in C:N ratio of feeds and consumer vs differences in N waste
+
+```{r}
+# Import dataset - some data manipulation is needed after obtaining model outputs
+panelplot <- read.csv("input_data/wirtzpanelplotv1.csv", encoding = "UTF-8")
+
+# Load necessary libraries
+library(ggplot2)
+library(grid)
+library(wesanderson)
+library(ggpubr)
+library(ggrepel)
+library(ggtext)
+
+# Plot 1
+plot1 <- ggplot(panelplot, aes(x = C_N_ratio_feed, y = growthG_model., color = feed)) +
+  geom_point(size = 6) +
+  geom_point(shape = "x", size = 9, data = panelplot, aes(x = C_N_ratio_feed, y = growthG_expt)) +
+  geom_text_repel(aes(label = feed), size = 6, box.padding = 0.5, point.padding = 0.5, max.overlaps = Inf, min.segment.length = 0.1) +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 16),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.line = element_line(colour = "black"))+
+  labs(size = 11, x = expression("C:N ratio of feeds"), y = expression(atop("growth rate", paste("day"^"-1")))) +
+  scale_color_manual(values = wes_palette("GrandBudapest1"))
+
+# Plot 2
+plot2 <- ggplot(panelplot, aes(x = C_N_ratio_feed, y = n_waste_model, color = feed)) +
+  geom_point(size = 6) +
+  geom_point(shape = "x", size = 9, data = panelplot, aes(x = C_N_ratio_feed, y = n_waste_conv)) +
+  geom_text_repel(aes(label = feed), size = 6, box.padding = 0.75, point.padding = 0.75, max.overlaps = Inf, min.segment.length = 0.1) +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 16),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.line = element_line(colour = "black")) +
+  labs(size = 11, x = expression("C:N ratio of feeds"), y = expression(atop("N waste output", paste("mol N mol C"^"-1"*"day"^"-1")))) +
+  scale_color_manual(values = wes_palette("GrandBudapest1"))
+
+# Plot 3
+plot3 <- ggplot(panelplot, aes(x = C_N_ratio_diff_con_feed, y = n_waste_percentage, color = feed)) +
+  geom_point(size = 6) +  
+  geom_text_repel(aes(label = feed), size = 6, box.padding = 0.75, point.padding = 0.75, max.overlaps = Inf, min.segment.length = 0.1)  + 
+  theme(legend.position = "none",
+        axis.title = element_text(size = 16),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.text = element_text(size = 14),
+        axis.line = element_line(colour = "black")) +  coord_cartesian(xlim =c(0,4.5),ylim = c(0, 200)) + 
+  labs(size = 11, x = expression("Differences in C:N ratio of feeds and consumer"), y = expression(atop("Percentage differences in N waste", paste("(model prediction- conventional approach)")))) +
+  scale_color_manual(values = wes_palette("GrandBudapest1"))
+
+# Arrange plots
+wirtzwasteplot <- ggarrange(plot1, plot2, plot3, nrow = 3)
+
+# Save the plot as pdf
+# Open the PDF device
+cairo_pdf("wirtzwasteplot.pdf", width = 10, height = 16.5)
+
+# Print the combined plot to the device
+print(wirtzwasteplot)
+
+# Close the PDF device
+dev.off()
+```
+
+#### EXPERIMENT 2 -\> Go back to model functions file, change tau and eta values,
+
+#### Use the code below for landman2021a calibration
+
+#### for Landman 2021a : tau 0.04; eta 0.00002
+
+```{r}
+source("GS_model_functions.R") 
+fvinput<-read.csv("input_data/landman2021input.csv") #your input file with G,fV range from 0-1, betaV and betaH if available 
+fvinput$Protein_intake<-NA
+fvinput$Lipid_intake<-NA # "wirztobs.csv", "landman2021aobs.csv", "landman2021bobs.csv" 
+input<-read.csv("input_data/landman2021aobs.csv")    
+```
+
+## Step 1: Run app
+
+```{r}
+ source("app.R") #shiny_gs() ## interactively, this indicates kstarN as candidate parameter
+```
+
+## Step 2 - get fV values
+
+```{r}
+coefs<-lm(data=input,Lipid_intake ~Protein_intake-1) 
+predLI<-predict(coefs) #PREDICT LIPID INTAKE coefs predLI
+```
+
+use linear regression or exact observed intake values for each feed
+
+#determining fV for each datapoint when kstarN=0.9,phi=0
+
+```{r}
+out<-pbapply(X=as.matrix(input[,c(2,3,5,6)]),1,GSforwardmodel,kstarN=0.9,phi=0) 
+fV<-c(out[[1]]$fV,out[[2]]$fV,out[[3]]$fV,out[[4]]$fV,out[[5]]$fV,out[[6]]$fV)
+#add to obsinput
+input$fV<-fV
+```
+
+*IMPORTANT: check fV values for all feeds here. If any of them are 0, please change the optimisation function to optim (c(0.9,0) instead of the model default optim (c(0.9,0.5) we assume from Anderson et al 2020*
+
+## Step 3 - get best parameter set for each feed type
+
+```{r}
+#for more than one variable to estimate need to use optim
+D1est<-optim(c(0.9,0.5),getError,input=input,feed="D1",paramname="both",method="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001)) 
+D2est<-optim(c(0.9,0.5),getError,input=input,feed="D2",paramname="both",method="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001))
+D3est<-optim(c(0.9,0.5),getError,input=input,feed="D3",paramname="both",method="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001)) 
+D4est<-optim(c(0.9,0.5),getError,input=input,feed="D4",paramname="both",method ="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001)) 
+
+#fV for D5 was predicted as 0, so have changed the optim below to reflect that 
+D5est<-optim(c(0.9,0.5),getError,input=input,feed="D5",paramname="both",method ="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001)) 
+D6est<-optim(c(0.9,0),getError,input=input,feed="D6",paramname="both",method ="L-BFGS-B",upper=c(1.0,1.0),lower=c(0.00001,0.00001)) 
+pars<-rbind(D1est$par,D2est$par,D3est$par,D4est$par,D5est$par,D6est$par)
+```
+
+### check to see if these make sense
+
+```{r}
+feed=c("D1","D2","D3","D4","D5","D6")
+input$pred_Protein_intake<-NA
+input$pred_Lipid_intake<-NA 
+for (i in 1:6){ finput<-data.frame(G=input[input$Feed==feed[i],"G"],fV=input[input$Feed==feed[i],"fV"],betaV=input[input$Feed==feed[i],"betaV"],betaH=input[input$Feed==feed[i],"betaH"],input[input$Feed==feed[i],"Lipid_intake"],input[input$Feed==feed[i],"Protein_intake"])
+input[i,c(8:9)]<-GSreversemodel(finput,kstarN = pars[i,1],phi = pars[i,2]) }
+
+#add pars kstarN and phi to dataframe
+input$kstarN<-pars[,1]
+input$phi<-pars[,2]
+
+#replace matrix 10 times for each value of fV 0:1
+M<-as.matrix(input[,-1]) 
+input_array<-matrix(rep(t(M),10),ncol=dim(M)[2],byrow=TRUE) 
+colnames(input_array)<-names(input[,-1]) 
+input_array<-data.frame(Feed=input[,1],input_array) # replace fVs with 0.1 to 1 instead of calibrated values 
+#create full array of inputs with varying fV form 0:1; #check to see if these make sense
+input_array[,"fV"]<-rep(seq(0.1,1,0.1),each=6)
+
+#write over observed Protein and Lipid intake values with predicted ones
+for (i in 1:dim(input_array)[1]) input_array[i,c("pred_Protein_intake","pred_Lipid_intake")]<-unlist(GSreversemodel(input_array[i,],kstarN=input_array[i,"kstarN"],phi=input_array[i,"phi"]))
+
+```
+
+#### get predicted calibrated values for plotting
+
+```{r}
+# Initialize columns
+input$pred_Protein_intake <- NA
+input$pred_Lipid_intake <- NA 
+
+# Loop to fill the predictions
+for (i in 1:6) { 
+  input[i, c(8:9)] <- GSreversemodel(as.matrix(input[i, -1]), kstarN = input[i, "kstarN"], phi = input[i, "phi"])
+}
+
+#saving input as dataframe here for goodness of fit plot 
+saveRDS(input,"fig5landman1data.RDS")
+
+
+# Plotting observed vs predicted intakes with intake rails
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+
+landman2021aplot <- ggplot(input, aes(x = Protein_intake, y = Lipid_intake, group = G)) + 
+  scale_color_continuous(type = "viridis") + 
+  geom_point(size = 3.5, aes(color = G)) + 
+  geom_point(size = 5, shape = "X", data = input, aes(x = pred_Protein_intake, y = pred_Lipid_intake, color = G)) + 
+  geom_abline(slope = unlist(coefs[1]), intercept = 0, linetype = 2) + 
+  geom_path(data = input_array, aes(x = pred_Protein_intake, y = pred_Lipid_intake, color = G)) + 
+  lims(x = c(0, 0.11), y = c(0, 0.06)) + 
+  labs(size = 4, 
+       x = expression("Protein intake mol C mol C"^"-1"~day^"-1"), 
+       y = expression("Lipid intake mol C mol C"^"-1"~day^"-1"), 
+       color = "growth rate") + 
+  theme(axis.title = element_text(size = 14)) + 
+  theme(legend.position = c(1,1), legend.justification = c("right", "top"), legend.box.just = "right", legend.margin = margin(6, 6, 6, 6)) + 
+  geom_text_repel(size = 3, data = input, aes(label = Feed)) + 
+  annotate("text", x = 0.025, y = 0.007, label = "fV=0.18", angle = 0) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+landman2021aplot<- landman2021aplot + theme(aspect.ratio = 0.75)
+print(landman2021aplot)
+
+
+#ggsave("manuscript_plots/landman2021aplot.png",landman2021aplot)
+
+# Saving input data
+# Renaming predicted intake columns
+names(input)[8] <- "Protein_intake" 
+names(input)[9] <- "Lipid_intake" 
+
+# Save dataframe as RDS
+saveRDS(input, "newlandman1input.RDS")
+```
+
+#### Supplementary figure 1: Landman et al 2021a wasteplot
+
+```{r}
+library(wesanderson) 
+landman1fwdmode<-readRDS("newlandman1input.RDS") 
+rownames<-landman1fwdmode$Feed
+landman1fwdmode<-as.matrix(landman1fwdmode[,c(5,6,8,9,10,11)])
+rownames(landman1fwdmode)<-rownames
+out4<-pbapply(X=landman1fwdmode,1,GSforwardmodel)
+#save output here if needed for other metabolic outputs
+saveRDS(out4, "landman1fwdmodeoutputs.RDS")
+out5<-c(out4[[1]]$Pellet_N,out4[[2]]$Pellet_N,out4[[3]]$Pellet_N,out4[[4]]$Pellet_N,out4[[5]]$Pellet_N,out4[[6]]$Pellet_N)
+landman1fwdmode$Nwaste<-out5 
+landman1fwdmode$CP_feed<-c(60.5,59.77,60.57,61.34,61.02, 61.82) 
+landman1fwdmode<-data.frame(landman1fwdmode) 
+l1waste<-ggplot(landman1fwdmode, aes(x = CP_feed, y = Nwaste, color = rownames)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 4, color = "black", data = landman1fwdmode, aes(label = rownames)) +
+  scale_color_manual(values = wes_palette("BottleRocket1")) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    legend.position = "none",
+    axis.title = element_blank() # This removes the axis labels
+  ) +
+  lims(x = c(52, 67), y = c(0, 0.010))
+
+#+ labs(size=8,x=expression("C:N ratio in feed"),y=expression("Nitrogenous waste output mol N mol C"^"-1"*"day"^"-1"))
+
+#saving plot as a grob 
+g6 <- ggplotGrob(l1waste)
+```
+
+#### EXPERIMENT 3 -\> landman2021binput.csv
+
+#### go back to model functions file, change tau and eta values tau 0.02; eta 0.00001
+
+#### Step 0: Import datasets
+
+```{r}
+source("GS_model_functions.R")
+ #get input data - ""landman2021binputs.csv" 
+fvinput<-read.csv("input_data/landman2021binputs.csv") #your input file with G,fV range from 0-1, betaV and betaH if available 
+fvinput$Protein_intake<-NA
+fvinput$Lipid_intake<-NA # "wirztobs.csv", "landman2021aobs.csv", "landman2021bobs.csv" 
+input<-read.csv("input_data/landman2021bobs.csv")
+```
+
+#### Step 1: Run app
+
+```{r}
+source("app.R") #shiny_gs() ## interactively, this indicates kstarN as candidate parameter
+```
+
+#### Step 2 - get fV values
+
+use linear regression or exact observed intake values for each feed
+
+```{r}
+coefs<-lm(data=input,Lipid_intake ~Protein_intake-1)
+predLI<-predict(coefs) #PREDICT LIPID INTAKE coefs predLI
+```
+
+#### or for each data point
+
+```{r}
+out<-pbapply(X=as.matrix(input[,c(2,3,5,6)]),1,GSforwardmodel,kstarN=0.9,phi=0) 
+fV<-c(out[[1]]$fV,out[[2]]$fV,out[[3]]$fV,out[[4]]$fV,out[[5]]$fV,out[[6]]$fV,out[[7]]$fV)
+# add to obsinput
+input$fV<-fV
+```
+
+*IMPORTANT: check fV values for all feeds here. If any of them are 0, please change the optimisation function to optim (c(0.9,0) instead of the model default optim (c(0.9,0.5) we assume from Anderson et al 2020*
+
+#### Step 3 - get best parameter set for each feed type \# for more than one variable to estimate need to use optim
+
+```{r}
+BM0est<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BM0%",paramname="withbetas",method="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,1e-10,1e-10,1e-10)) 
+BM16est<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BM1.6%",paramname="withbetas",method="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,1e-10,1e-10,1e-10)) 
+BM31est<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BM3.1%",paramname="withbetas",method="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,1e-10,1e-10,1e-10)) 
+BM63est<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BM6.3%",paramname="withbetas",method ="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,1e-10,1e-10,1e-10)) 
+BM125est<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BM12.5%",paramname="withbetas",method ="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,1e-10,1e-10,1e-10)) 
+BM250est<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BM25%",paramname="withbetas",method ="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,0.00001,0.00001,0.00001)) 
+BMHSest<-optim(c(0.9,0.5,0.6,0.6),getError,input=input,feed="BMHS",paramname="withbetas",method ="L-BFGS-B",upper=c(1.0,1.0,1.0,1.0),lower=c(0.00001,0.00001,0.00001,0.00001)) 
+pars<-rbind(BM0est$par,BM16est$par,BM31est$par,BM63est$par,BM125est$par,BM250est$par,BMHSest$par)
+
+#adding columns for parameters
+colnames(pars)<-c("kstarN","phi","betaV","betaH") 
+rownames(pars)<-input$Feed
+#replace input with calibrated values 
+input[,"betaV"]<-pars[,"betaV"] 
+input[,"betaH"]<-pars[,"betaH"] 
+input$phi<-input$kstarN<-NA
+input[,"kstarN"]<-pars[,"kstarN"]
+input[,"phi"]<-pars[,"phi"]
+
+#replace matrix 10 times for each value of fV 0:1
+
+M<-as.matrix(input[,-1]) 
+input_array<-matrix(rep(t(M),10),ncol=dim(M)[2],byrow=TRUE) 
+colnames(input_array)<-names(input[,-1]) 
+input_array<-data.frame(Feed=input[,1],input_array) 
+# replace fVs with 0.1 to 1 instead of calibrated values 
+input_array[,"fV"]<-rep(seq(0.1,1,0.1),each=7)
+
+#check to see if these make sense
+
+#create full array of inputs with varying fV form 0:1
+
+#write over observed Protein and Lipid intake values with predicted ones
+for (i in 1:dim(input_array)[1])input_array[i,c("pred_Protein_intake","pred_Lipid_intake")]<-unlist(GSreversemodel(input_array[i,],kstarN=input_array[i,"kstarN"],phi=input_array[i,"phi"],betaV=input_array[i,"betaV"],betaH=input_array[i,"betaH"]))
+
+#get predicted calibrated values for plotting
+
+#feed=c("BM0","BM16","BM31","BM63","BM125","BM250","BMHS") 
+input$pred_Protein_intake<-NA
+input$pred_Lipid_intake<-NA
+for (i in 1:7){ input[i,c(10:11)]<-GSreversemodel(as.matrix(input[i,-1]),kstarN = pars[i,"kstarN"],phi = pars[i,"phi"],betaV = pars[i,"betaV"],betaH = pars[i,"betaH"]) }
+
+
+#saving input as dataframe for goodness of fit plot 
+saveRDS(input,"fig5landman2data.RDS")
+
+
+```
+
+Figure 3: Intake arrays/ rails
+
+```{r}
+#plotting
+# Load necessary libraries
+library(ggplot2) 
+library(ggrepel)
+library(readr)
+library(viridis)
+
+# Ensure input is a data frame
+input <- as.data.frame(input)
+
+# Plotting observed vs predicted intakes with intake rails
+landman2021bplot <- ggplot(input, aes(x = Protein_intake, y = Lipid_intake, color = G)) + 
+  scale_color_continuous(type = "viridis") + 
+  geom_point(size = 3.5) + 
+  geom_point(data = input, size = 6, shape = "X", aes(x = pred_Protein_intake, y= pred_Lipid_intake, z = G)) + 
+  geom_abline(slope = unlist(coefs[1]), intercept = 0, linetype = 2) + geom_line(data = input_array, aes(x = pred_Protein_intake, y = pred_Lipid_intake, group = G)) + 
+  lims(x = c(0, 0.11), y = c(0, 0.06)) + 
+  labs(size = 4, 
+       x = expression("Protein intake mol C mol C"^"-1"~day^"-1"), 
+       y = expression("Lipid intake mol C mol C"^"-1"~day^"-1"), 
+       color = "growth rate") + 
+  theme(axis.title = element_text(size = 14)) + 
+  theme(legend.position = c(1,1), legend.justification = c("right", "top"), legend.box.just = "right", legend.margin = margin(6, 6, 6, 6)) + 
+  geom_text_repel(size = 3, data = input, aes(label = Feed), color = "black") + 
+  annotate("text", x = 0.01, y = 0.006, label = "fV=0.25", angle = 0) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+landman2021bplot<-landman2021bplot+ theme(aspect.ratio = 0.75)
+#Print the plot
+print(landman2021bplot)
+ggsave("manuscript_plots/landman2021bplot.png", landman2021bplot)
+```
+
+renaming pred_protein_intake and pred_Lipid_intake as IV and IH for saving df to run in forward mode
+
+```{r}
+names(input)[10]<-"Protein_intake" 
+names(input)[11]<-"Lipid_intake" #save df as RDS just in case you need to go back and ref and you've cleared the environment 
+library(readr)
+saveRDS(input,"newlandman2input.RDS") #wasteplot 
+landman2fwdmode<-readRDS("newlandman2input.RDS") 
+rownames<-landman2fwdmode$Feed
+landman2fwdmode<-as.matrix(landman2fwdmode[,c(5,6,8,9,10,11)])
+rownames(landman2fwdmode)<-rownames
+out6<-pbapply(X=landman2fwdmode,1,GSforwardmodel)
+out7<-c(out6[[1]]$Pellet_N,out6[[2]]$Pellet_N,out6[[3]]$Pellet_N,out6[[4]]$Pellet_N,out6[[5]]$Pellet_N,out6[[6]]$Pellet_N,out6[[7]]$Pellet_N) 
+landman2fwdmode$Nwaste<-out7
+landman2fwdmode$CP_feed<-c(62.31,62.68,61.19,60.82,61.44,61.49,54.31) 
+landman2fwdmode<-as.data.frame(landman2fwdmode)
+
+##plotting C:N ratio in feed vs Nitrogenous waste output
+library(ggplot2) 
+library(ggrepel)
+library(wesanderson)
+
+#Your original ggplot code without theme and limits
+l2waste <- ggplot(landman2fwdmode, aes(x = CP_feed, y = Nwaste, color = rownames)) + 
+  geom_point(size = 4) + 
+  scale_color_manual(values = wes_palette("BottleRocket1")) + 
+  geom_text_repel(size = 4, color = "black", aes(label = rownames)) + 
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black"),
+    axis.title = element_blank(), # This removes the axis labels
+    legend.position = "none"
+  ) + 
+  lims(x = c(52, 67), y = c(0, 0.015))
+
+#+ labs(x = expression("C:N ratio in feed"), y = expression("Nitrogenous waste output mol N mol C"^"-1"*"day"^"-1"))
+print(l2waste) 
+#save l2waste as a grob 
+g7 <- ggplotGrob(l2waste)
+```
+
+# Supplementary information figure 1: N waste predictions for study 2 and 3
+
+**Combining landman 1 and landman 2 in a single plot window**
+
+```{r}
+# Load necessary libraries
+library(ggpubr)
+library(ggplot2)
+library(grid)
+
+# Assuming g6 and g7 are already defined ggplot objects
+# Combine the plots
+g8 <- ggarrange(g6, g7, nrow = 1, ncol = 2)
+
+# Annotate the combined plot
+annotated_g8 <- annotate_figure(
+  g8,
+  left = textGrob(expression("N waste output mol C"~mol~C^{-1}~day^{-1}), rot = 90, vjust = 1, gp = gpar(cex = 1.3)),
+  bottom = textGrob(expression("Crude protein percentage(%) in feed"), gp = gpar(cex = 1.3))
+)
+
+# Save the annotated plot to TIFF format
+tiff("supfig1.tiff", units="in", width=16.5, height=6.3, res=300)
+print(annotated_g8)  # Print the annotated plot to the TIFF device
+dev.off()  # Close the TIFF device
+```
+
+#### Figure 4: Protein and lipid intake arrays #Panel plot (3 columns).
+
+#### A. Wirtz et al; B. Landman et al 2021a; C. Landman et al 2021b
+
+```{r}
+library(gridExtra)
+library(grid)
+library(png)
+library(grid)
+
+library(cowplot)
+library(grid)
+library(cowplot)
+library(grid)
+
+# Define your plots
+g1 <- as_grob(wirtzplot)
+g2 <- as_grob(landman2021aplot)
+g3 <- as_grob(landman2021bplot)
+
+# Combine plots with labels
+combined_plot <- plot_grid(
+  g1, g2, g3,
+  ncol = 3,
+  labels = c("A", "B", "C"),
+  label_size = 16,  # Size of the labels
+  label_x = c(0.05, 0.35, 0.65),  # x positions for labels
+  label_y = 1.05  # y position for labels
+)
+
+# Open the PDF device
+cairo_pdf("combined_plot.pdf", width = 16.5, height = 6.3)
+
+# Print the combined plot to the device
+print(combined_plot)
+
+# Close the PDF device
+dev.off()
+
+```
+
+#### FIGURE 5: Goodness of fit tests
+
+#### predicted vs observed protein and lipid values
+
+```{r}
+#combine the dataframes from all 3 experiments
+df1<-readRDS("fig5wirtzdata.RDS")
+df2<-readRDS("fig5landman1data.RDS")
+df3<-readRDS("fig5landman2data.RDS")
+df_combined <-bind_rows(df1,df2,df3)
+saveRDS(df_combined, "goodnessoffitdata.RDS")
+fitdata<-readRDS("goodnessoffitdata.RDS")
+```
+
+#### Plotting
+
+```{r}
+#predicted vs observed we want two panels:
+#a) all values across all experiments predicted for Lipid intake vs all values across all experiments observed Lipid intakes, with a 1:1 line on the plot
+library(ggplot2)
+library(ggrepel)
+#fitdata<-read.csv("fitdata.csv")
+#readRDS("goodnessoffit.RDS")
+proteinplot<-ggplot(fitdata,aes(x=pred_Protein_intake,y=Protein_intake))+geom_point()+ geom_abline(intercept=0,linetype=2)+geom_text_repel(size=5,data=fitdata,aes(label = Feed))+
+  theme(axis.title = element_text(size = 14),panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "black"))+ 
+  labs(size=8,x=expression("Predicted crude protein intake mol C mol C"^"-1"*"day"^"-1"),y=expression("Observed crude protein intake mol C mol C"^"-1"*"day"^"-1"),par(cex.axis = 1.3))
+
+#Calculating rsquared
+x<-fitdata$pred_Protein_intake
+y<-fitdata$Protein_intake
+proteinpred<-lm(y~x)
+summary(proteinpred)$r.squared
+
+
+#b)all values across all experiments predicted for Protein intake vs all values across all experiments observed Protein intakes, with a 1:1 line on the plot
+lipidplot<-ggplot(fitdata,aes(x=pred_Lipid_intake,y=Lipid_intake))+geom_point()+ geom_abline(intercept=0,linetype=2)+geom_text_repel(size=5,data=fitdata,aes(label = Feed))+ 
+theme(axis.title = element_text(size = 14),panel.grid.major = element_blank(),panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "black"))+ 
+  labs(size=8,x=expression("Predicted lipid intake mol C mol C"^"-1"*"day"^"-1"),y=expression("Observed lipid intake mol C mol C"^"-1"*"day"^"-1"),par(cex.axis = 1.3))
+
+#calculating rsquared
+a<-fitdata$pred_Lipid_intake
+b<-fitdata$Lipid_intake
+lipidpred<-lm(b~a)
+summary(lipidpred)$r.squared
+
+#combine above plots in single window 
+library(ggpubr)
+library(ggplot2)
+library(grid)
+predvsobserved<-ggarrange(proteinplot,lipidplot,ncol = 2,nrow=1,labels = c("A","B"))
+
+#save the above plot as a tiff file. 
+#tiff("fig5.tiff", units = "in", width = 16.5, height = 6.3, res = 300)
+print(predvsobserved)  # Print again before saving
+#dev.off()
+```
+
+#### Identifying outliers in lipid prediction- v2 of plot excluding SWM
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+
+# Function to identify outliers based on IQR
+identify_outliers <- function(data, column) {
+  Q1 <- quantile(data[[column]], 0.25, na.rm = TRUE)
+  Q3 <- quantile(data[[column]], 0.75, na.rm = TRUE)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  data[[column]] < lower_bound | data[[column]] > upper_bound
+}
+
+# Identify outliers for Protein intake
+protein_outliers <- identify_outliers(df_combined, "Protein_intake")
+protein_outliers_df <- df_combined[protein_outliers, ]
+print("Protein Intake Outliers:")
+print(protein_outliers_df)
+
+# Identify outliers for Lipid intake
+lipid_outliers <- identify_outliers(df_combined, "Lipid_intake")
+lipid_outliers_df <- df_combined[lipid_outliers, ]
+print("Lipid Intake Outliers:")
+print(lipid_outliers_df)
+
+# Combine outliers from both Protein and Lipid intakes
+outliers_combined <- Reduce(`|`, list(protein_outliers, lipid_outliers))
+
+# Remove outliers, keeping 'BMHS'
+df_clean <- df_combined[!(outliers_combined & df_combined$Feed != 'none'), ]
+
+# Optional: Check how many rows were excluded
+print(paste("Number of rows excluded:", nrow(df_combined) - nrow(df_clean)))
+
+# Protein intake plot
+proteinplot <- ggplot(df_clean, aes(x = pred_Protein_intake, y = Protein_intake)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  geom_text_repel(size = 5, aes(label = Feed)) +
+  theme(axis.title = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  labs(x = expression("Predicted crude protein intake mol C mol C"^"-1"*"day"^"-1"),
+       y = expression("Observed crude protein intake mol C mol C"^"-1"*"day"^"-1"),
+       par(cex.axis = 1.3))
+
+# Calculating R-squared for protein intake
+protein_r_squared <- summary(lm(Protein_intake ~ pred_Protein_intake, data = df_clean))$r.squared
+print(paste("Protein intake R-squared:", protein_r_squared))
+
+# Lipid intake plot
+lipidplot <- ggplot(df_clean, aes(x = pred_Lipid_intake, y = Lipid_intake)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = 2) +
+  geom_text_repel(size = 5, aes(label = Feed)) +
+  theme(axis.title = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black")) +
+  labs(x = expression("Predicted lipid intake mol C mol C"^"-1"*"day"^"-1"),
+       y = expression("Observed lipid intake mol C mol C"^"-1"*"day"^"-1"),
+       par(cex.axis = 1.3))
+
+# Calculating R-squared for lipid intake
+lipid_r_squared <- summary(lm(Lipid_intake ~ pred_Lipid_intake, data = df_clean))$r.squared
+print(paste("Lipid intake R-squared:", lipid_r_squared))
+
+# Combine plots in a single window
+predvsobserved <- ggarrange(proteinplot, lipidplot, ncol = 2, nrow = 1, labels = c("A", "B"))
+print(predvsobserved)
+
+# Save the plot
+#tiff("fig5_outliersremoved.tiff", units = "in", width = 16.5, height = 6.3, res = 300)
+print(predvsobserved)  # Print again before saving
+#dev.off()
+```
